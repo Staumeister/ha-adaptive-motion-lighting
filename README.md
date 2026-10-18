@@ -65,7 +65,16 @@ Leave out `initial:`, so the helpers keep their values across restarts.
 
 ### 2. Import the blueprint
 
-Use the import button above, or copy `adaptive_motion_lighting.yaml` to `config/blueprints/automation/<your-name>/`. Then go to **Settings → Automations & scenes → Blueprints → Adaptive Motion Lighting → Create automation**.
+Choose one of these:
+
+- Click the import button above.
+- In Home Assistant, go to **Settings → Automations & scenes → Blueprints → Import blueprint** and paste the link to the blueprint file. The link to the repository's front page does not work.
+  ```
+  https://github.com/Staumeister/ha-adaptive-motion-lighting/blob/main/adaptive_motion_lighting.yaml
+  ```
+- Copy `adaptive_motion_lighting.yaml` to `config/blueprints/automation/<your-name>/`.
+
+Then open the blueprint and choose **Create automation**.
 
 ### 3. Fill in the essentials
 
@@ -94,26 +103,39 @@ Whichever you choose, "empty" means empty for the full vacancy delay *since the 
 
 ## Recipes
 
-### Any ZHA remote
+### Connecting a remote or buttons
 
-The easiest route is to pick the device triggers that ZHA offers for your remote under **Buttons and remotes**. If your remote has none, use its raw events instead:
+Each button action (**Manual ON**, **OFF**, **TOGGLE**, **Resume AUTO**, **PAUSE**) is a list of ordinary Home Assistant triggers, so it works with any integration. You can add several triggers to one action, for example two remotes.
 
-1. Open **Developer tools → Events** and listen to `zha_event`.
-2. Press a button and note `device_id`, `command` and, if present, `endpoint_id`.
-3. Add an *Event* trigger with those values to the matching action:
+In the blueprint form, the trigger picker may not offer button triggers such as *"First button short press"*. If not, build the trigger in an empty automation and copy it over:
 
-```yaml
-- trigger: event
+1. Create a new, empty automation. You won't save it.
+2. **Add trigger → Device →** your remote, then choose the button and press type.
+3. Open the trigger's **⋮** menu → **Edit in YAML** and copy the text. For a ZHA remote it looks like this:
+   ```yaml
+   trigger: device
+   domain: zha
+   device_id: 1234abcd...
+   type: remote_button_short_press
+   subtype: button_1
+   ```
+4. In your blueprint automation, open **Buttons and remotes**, add a trigger to the action you want, then use **⋮ → Edit in YAML** to replace its content with the copied text.
+5. Repeat for each button. In the scratch automation you can change just the `type` and `subtype` lines. Discard the scratch automation when you're done.
+
+**No device triggers for your remote?** Use its raw events instead:
+
+- **ZHA:** in **Developer tools → Events**, listen to `zha_event` and press a button. Note `device_id`, `command` and, if shown, `endpoint_id`, then use:
+  ```yaml
+  trigger: event
   event_type: zha_event
   event_data:
     device_id: YOUR_DEVICE_ID
     command: YOUR_COMMAND   # e.g. on, off, toggle, short_release, long_press
     endpoint_id: 1          # only if your remote reports it
-```
+  ```
+- **Zigbee2MQTT, Hue, Matter, Shelly:** use a *State* trigger on the remote's `event.*` or `sensor.*_action` entity, with `to:` set to the action name.
 
-### Zigbee2MQTT, Hue, Matter, etc.
-
-Use **Device** triggers from the picker, or a *State* trigger on the remote's `event.*` / `sensor.*_action` entity. Each button field accepts several triggers, so one action can be bound to more than one remote.
+**Testing:** press a button, then open the automation's **Traces**. The `plan` variable should show `why: button on`, `button off` and so on.
 
 ### Night light after 23:00
 
