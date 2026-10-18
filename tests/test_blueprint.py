@@ -267,6 +267,127 @@ def test_second_trigger_in_a_button_group_is_recognised():
     assert sim.state("light.ceiling") == "on"
 
 
+def test_remote_triggers_are_disabled_until_configured():
+    bp = load_blueprint()
+    remote = [t for t in bp["triggers"] if t.get("id") == "remote"]
+    assert [t["trigger"] for t in remote] == ["event"]
+    sim = make()
+    remote_idx = [i for i, t in enumerate(sim.triggers) if t.get("id") == "remote"]
+    assert [sim.enabled[i] for i in remote_idx] == [False]
+    sim.fire_event("zha_event", {"device_id": ZHA_ONOFF, "command": "on"})
+    assert not sim.runs and not sim.skipped
+
+
+def test_every_mapped_press_has_a_dropdown_option():
+    bp = load_blueprint()
+    options = {o["value"] for o in input_definitions(bp)["press_on"]["selector"]["select"]["options"]}
+    template = bp["variables"]["remote_press"]
+    found = set(re.findall(r"'((?:b\d|center|left|right)_(?:short|double|long))'", template))
+    assert found <= options, found - options
+    for name in ["press_off", "press_toggle", "press_auto", "press_pause"]:
+        assert input_definitions(bp)[name]["selector"] == input_definitions(bp)["press_on"]["selector"]
+
+
+ZHA_ONOFF, ZHA_ROUND, ZHA_SOMRIG, ZHA_BILRESA = "dev_onoff", "dev_round", "dev_somrig", "dev_bilresa"
+DEVICES = {
+    ZHA_ONOFF: {"name": "TRADFRI on/off switch", "model": "TRADFRI on/off switch"},
+    ZHA_ROUND: {"name": "TRADFRI remote control", "model": "TRADFRI remote control"},
+    ZHA_SOMRIG: {"name": "SOMRIG shortcut button", "model": "SOMRIG shortcut button"},
+    ZHA_BILRESA: {"name": "BILRESA", "model": "09B9"},
+}
+ZHA_ALL = {"ikea_zha_remotes": [ZHA_ONOFF, ZHA_ROUND, ZHA_SOMRIG, ZHA_BILRESA]}
+
+
+def zha(sim, device, command, endpoint=1, **params):
+    sim.fire_event("zha_event", {"device_id": device, "endpoint_id": endpoint, "cluster_id": 6,
+                                 "command": command, "args": list(params.values()), "params": params})
+
+
+def test_ikea_on_off_switch_defaults_zha():
+    sim = make(ZHA_ALL, devices=DEVICES)
+    zha(sim, ZHA_ONOFF, "on")
+    assert (sim.state("light.ceiling"), mode(sim)) == ("on", "Manual on")
+    zha(sim, ZHA_ONOFF, "off")
+    assert (sim.state("light.ceiling"), mode(sim)) == ("off", "Manual off")
+    zha(sim, ZHA_ONOFF, "move_with_on_off", move_mode=0, rate=83)  # long I
+    assert mode(sim) == "Auto"
+    zha(sim, ZHA_ONOFF, "move", move_mode=1, rate=83)  # long O
+    assert mode(sim) == "Paused"
+    zha(sim, ZHA_ONOFF, "stop_with_on_off")  # release: not a press we use
+    assert sim.skipped[-1]["event"] == "remote_other"
+    zha(sim, "dev_not_selected", "on")
+    assert mode(sim) == "Paused", "other devices are ignored"
+
+
+def test_ikea_round_remote_zha():
+    sim = make(ZHA_ALL | {"press_on": ["left_short"], "press_off": ["right_long"], "press_pause": ["center_long"]},
+               devices=DEVICES)
+    zha(sim, ZHA_ROUND, "toggle")
+    assert (sim.state("light.ceiling"), mode(sim)) == ("on", "Manual on")
+    zha(sim, ZHA_ROUND, "hold", param1=3328, param2=0)  # right long
+    assert (sim.state("light.ceiling"), mode(sim)) == ("off", "Manual off")
+    zha(sim, ZHA_ROUND, "release", param1=1200)  # end of the arrow hold
+    assert mode(sim) == "Manual off"
+    zha(sim, ZHA_ROUND, "press", param1=257, param2=13, param3=0)  # left click
+    assert mode(sim) == "Manual on"
+    zha(sim, ZHA_ROUND, "release", param1=0)  # centre long
+    assert mode(sim) == "Paused"
+    zha(sim, ZHA_ROUND, "step_with_on_off", step_mode=0, step_size=43, transition_time=5)
+    assert sim.runs[-1]["event"] != "button_on" and sim.skipped[-1]["event"] == "remote_other", \
+        "▲ press is b1_short, not assigned here"
+
+
+def test_ikea_somrig_and_bilresa_zha():
+    sim = make(ZHA_ALL | {"press_toggle": ["b1_double"]}, devices=DEVICES)
+    zha(sim, ZHA_SOMRIG, "short_release", endpoint=1)
+    assert mode(sim) == "Manual on"
+    zha(sim, ZHA_SOMRIG, "initial_press", endpoint=2)
+    assert mode(sim) == "Manual on", "initial_press is ignored"
+    zha(sim, ZHA_SOMRIG, "short_release", endpoint=2)
+    assert mode(sim) == "Manual off"
+    zha(sim, ZHA_SOMRIG, "multi_press_complete", endpoint=1)
+    assert (sim.state("light.ceiling"), mode(sim)) == ("on", "Manual on")
+    # BILRESA uses the round remote's arrow command for its double press.
+    zha(sim, ZHA_BILRESA, "press", param1=256, param2=13, param3=0)
+    assert (sim.state("light.ceiling"), mode(sim)) == ("off", "Manual off")
+    zha(sim, ZHA_BILRESA, "move", move_mode=0, rate=83)
+    assert sim.runs[-1]["event"] == "button_auto"
+
+
+def test_ikea_bilresa_scroll_wheel_zha():
+    devices = {"dev_wheel_zha": {"name": "BILRESA wheel", "model": "09BA"}}
+    sim = make({"ikea_zha_remotes": ["dev_wheel_zha"]}, devices=devices)
+    zha(sim, "dev_wheel_zha", "on")  # the wheel sends on and off alternately
+    assert (sim.state("light.ceiling"), mode(sim)) == ("on", "Manual on")
+    zha(sim, "dev_wheel_zha", "off")
+    assert sim.runs[-1]["event"] == "button_toggle"
+    assert (sim.state("light.ceiling"), mode(sim)) == ("off", "Manual off")
+    zha(sim, "dev_wheel_zha", "move_to_level_with_on_off", level=120, transition_time=10)  # turning
+    assert mode(sim) == "Manual off"
+
+
+def test_unmapped_remote_press_does_not_interrupt_warning():
+    sim = make(ZHA_ALL | {"warn_seconds": 30, "warn_brightness": 20, "default_brightness": 90}, devices=DEVICES)
+    motion(sim)
+    motion(sim, False)
+    sim.advance(301)
+    assert sim.attr("light.ceiling", "brightness") == 51
+    zha(sim, ZHA_ONOFF, "stop")  # releasing a long press
+    assert sim.skipped[-1]["event"] == "remote_other"
+    sim.advance(31)
+    assert sim.state("light.ceiling") == "off", "the warning was not restarted"
+
+
+def test_supported_remotes_and_trigger_buttons_together():
+    sim = make(ZHA_ALL, devices=DEVICES)
+    sim.press("button_on")
+    assert mode(sim) == "Manual on"
+    sim.press("button_pause")
+    assert mode(sim) == "Paused"
+    zha(sim, ZHA_ONOFF, "on")
+    assert sim.runs[-1]["event"] == "button_on"
+
+
 def test_pause_can_turn_lights_off():
     sim = make({"pause_action": "off"})
     motion(sim)

@@ -1,5 +1,5 @@
 # Adaptive Motion Lighting with Manual Override
-# Version: 1.0.0
+# Version: 1.1.0
 # Home Assistant: 2024.10.0+
 # License: MIT (see LICENSE)
 #
@@ -15,7 +15,8 @@
 #   * Precise `for:` state triggers handle normal switch-off; a template
 #     watchdog plus start/reload triggers recover anything a restart dropped.
 #   * The order of the fixed triggers matters: user button triggers are
-#     appended after them and identified by `trigger.idx`.
+#     appended after them and identified by `trigger.idx`. Supported-remote
+#     triggers (id `remote`) are fixed and mapped by the press_* inputs.
 #     Keep `fixed_trigger_count` in sync with the fixed trigger list.
 
 blueprint:
@@ -42,8 +43,9 @@ blueprint:
     its own lights, brightness, colour temperature, scenes, vacancy delay,
     and can disable automatic switch-on.
 
-    * Works with any remote: pick button triggers from any integration
-    (ZHA, Zigbee2MQTT, Hue, Matter, ...).
+    * IKEA remotes paired with ZHA (TRÅDFRI, RODRET, SOMRIG, BILRESA): just
+    pick them, buttons work out of the box and can be changed from dropdowns.
+    Any other remote works through ordinary triggers.
 
 
     **Required helper**: a Dropdown (`input_select`) with the options
@@ -241,37 +243,113 @@ blueprint:
       icon: mdi:remote
       collapsed: true
       input:
-        button_on:
+        ikea_zha_remotes:
+          name: IKEA remotes paired with ZHA
+          description: >
+            TRÅDFRI on/off switch, TRÅDFRI remote control (round, 5 buttons),
+            RODRET, SOMRIG, BILRESA. Just pick them; the buttons work as set
+            below.
+          default: []
+          selector:
+            device:
+              multiple: true
+              filter:
+                - integration: zha
+                  model: "TRADFRI on/off switch"
+                - integration: zha
+                  model: "TRADFRI remote control"
+                - integration: zha
+                  model: "RODRET Dimmer"
+                - integration: zha
+                  model: "RODRET wireless dimmer"
+                - integration: zha
+                  model: "SOMRIG shortcut button"
+                - integration: zha
+                  model: "09B9"
+                - integration: zha
+                  model: "09BA"
+        press_on:
           name: Manual ON
           description: Lights on with the current profile and start manual on. Inside paused, only switches the lights.
+          default: [b1_short]
+          selector: &presses
+            select:
+              multiple: true
+              options:
+                - label: "Button 1 / I / ▲ / one dot – press"
+                  value: b1_short
+                - label: "Button 1 / I / ▲ / one dot – double press"
+                  value: b1_double
+                - label: "Button 1 / I / ▲ / one dot – long press"
+                  value: b1_long
+                - label: "Button 2 / O / ▼ / two dots – press"
+                  value: b2_short
+                - label: "Button 2 / O / ▼ / two dots – double press"
+                  value: b2_double
+                - label: "Button 2 / O / ▼ / two dots – long press"
+                  value: b2_long
+                - label: "Centre (round remote) / scroll wheel – press"
+                  value: center_short
+                - label: "Centre / scroll wheel – double press"
+                  value: center_double
+                - label: "Centre (round remote) / scroll wheel – long press"
+                  value: center_long
+                - label: "◀ Left (round remote) – press"
+                  value: left_short
+                - label: "◀ Left (round remote) – long press"
+                  value: left_long
+                - label: "▶ Right (round remote) – press"
+                  value: right_short
+                - label: "▶ Right (round remote) – long press"
+                  value: right_long
+        press_off:
+          name: Manual OFF
+          description: Lights off and start manual off. Inside paused, only switches the lights.
+          default: [b2_short]
+          selector: *presses
+        press_toggle:
+          name: Manual TOGGLE
+          description: Acts as Manual ON when all lights are off, otherwise as Manual OFF.
+          default: [center_short]
+          selector: *presses
+        press_auto:
+          name: Resume AUTO
+          description: Return to auto and immediately apply what auto would do now.
+          default: [b1_long]
+          selector: *presses
+        press_pause:
+          name: PAUSE
+          description: Stop all automatic control until auto is resumed.
+          default: [b2_long]
+          selector: *presses
+        button_on:
+          name: Other remotes – Manual ON triggers
+          description: >
+            Any Home Assistant trigger, for remotes not listed above. See the
+            README for how to copy button triggers.
           default: []
           selector:
             trigger: {}
         button_off:
-          name: Manual OFF
-          description: Lights off and start manual off. Inside paused, only switches the lights.
+          name: Other remotes – Manual OFF triggers
           default: []
           selector:
             trigger: {}
         button_toggle:
-          name: Manual TOGGLE
-          description: Acts as Manual ON when all lights are off, otherwise as Manual OFF.
+          name: Other remotes – Manual TOGGLE triggers
           default: []
           selector:
             trigger: {}
         button_auto:
-          name: Resume AUTO
-          description: Return to auto and immediately apply what auto would do now.
+          name: Other remotes – Resume AUTO triggers
           default: []
           selector:
             trigger: {}
         button_pause:
-          name: PAUSE
-          description: Stop all automatic control until auto is resumed.
+          name: Other remotes – PAUSE triggers
           default: []
           selector:
             trigger: {}
-
     conditions:
       name: When lights may switch on automatically
       icon: mdi:weather-night
@@ -524,9 +602,10 @@ trigger_variables:
   p2_entities: !input p2_entities
   p2_lights: !input p2_lights
   p2_vacancy_delay: !input p2_vacancy_delay
+  ikea_zha_remotes: !input ikea_zha_remotes
 
 triggers:
-  # --- fixed triggers: keep in sync with fixed_trigger_count (13) ---------
+  # --- fixed triggers: keep in sync with fixed_trigger_count (14) ---------
   - trigger: state # 0
     id: occupied
     entity_id: !input occupancy_sensors
@@ -660,6 +739,15 @@ triggers:
     entity_id: !input p2_entities
     to: ~
 
+  # Supported IKEA remotes (ZHA). Presses are translated into button names
+  # such as `b1_short` by `remote_press` and mapped to actions by the press_*
+  # inputs. Disabled without remotes; `enabled` is evaluated once at setup
+  # and a disabled trigger keeps its idx.
+  - trigger: event # 13
+    id: remote
+    enabled: "{{ ikea_zha_remotes | count > 0 }}"
+    event_type: zha_event
+
   # --- user button triggers, identified by trigger.idx -------------------
   - triggers: !input button_on
   - triggers: !input button_off
@@ -729,13 +817,65 @@ variables:
     - [button_toggle, !input button_toggle]
     - [button_auto, !input button_auto]
     - [button_pause, !input button_pause]
-  fixed_trigger_count: 13
+  ikea_zha_remotes: !input ikea_zha_remotes
+  press_groups:
+    - [button_on, !input press_on]
+    - [button_off, !input press_off]
+    - [button_toggle, !input press_toggle]
+    - [button_auto, !input press_auto]
+    - [button_pause, !input press_pause]
+  fixed_trigger_count: 14
 
   # --- what happened ------------------------------------------------------
+  # A supported remote's press as b<n>_short/double/long, center_*, left_*,
+  # right_*, or '' when it is not a press we use (releases, dimming...).
+  # The BILRESA scroll wheel's press counts as the centre button; turning it
+  # is ignored. Source: zha-device-handlers quirks for these remotes.
+  remote_press: >-
+    {%- set ns = namespace(key='', wheel=false) -%}
+    {%- if trigger is defined and trigger.id is defined and trigger.id == 'remote' -%}
+      {%- set d = trigger.event.data -%}
+      {%- if d.device_id in ikea_zha_remotes -%}
+        {%- set c = d.command -%}
+        {%- set p = d.params if d.params is mapping else {} -%}
+        {%- set b = 'b' ~ d.endpoint_id -%}
+        {%- set round = device_attr(d.device_id, 'model') == 'TRADFRI remote control' -%}
+        {%- set ns.wheel = device_attr(d.device_id, 'model') == '09BA' -%}
+        {%- if c == 'move' -%}
+          {%- set ns.key = 'b1_long' if p.move_mode == 0 else 'b2_long' -%}
+        {%- elif c == 'press' and p.param1 in [256, 257] -%}
+          {#- Round remote: arrow click. BILRESA: double press. -#}
+          {%- set ns.key = (['right_short', 'left_short'] if round else ['b1_double', 'b2_double'])[p.param1 - 256] -%}
+        {%- elif c == 'hold' and p.param1 in [3328, 3329] -%}
+          {%- set ns.key = ['right_long', 'left_long'][p.param1 - 3328] -%}
+        {%- elif c == 'release' and p.param1 == 0 -%}
+          {%- set ns.key = 'center_long' -%}
+        {%- else -%}
+          {%- set ns.key = {'on': 'b1_short', 'off': 'b2_short', 'toggle': 'center_short',
+                            'step_with_on_off': 'b1_short', 'step': 'b2_short',
+                            'move_with_on_off': 'b1_long',
+                            'short_release': b ~ '_short', 'multi_press_complete': b ~ '_double',
+                            'long_press': b ~ '_long'}.get(c, '') -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
+    {#- Scroll wheel press: it sends on and off alternately. -#}
+    {%- if ns.wheel and ns.key -%}
+      {%- set ns.key = 'center_' ~ ns.key.split('_')[1] if ns.key.split('_')[1] in ['short', 'double', 'long'] else '' -%}
+    {%- endif -%}
+    {{ ns.key }}
   event: >-
     {%- set idx = (trigger.idx | int(-1)) if trigger is defined and trigger.idx is defined else -1 -%}
     {%- if idx < 0 -%}
       started
+    {%- elif idx < fixed_trigger_count and trigger.id == 'remote' -%}
+      {%- set ns = namespace(kind='remote_other') -%}
+      {%- for g in press_groups if remote_press and ns.kind == 'remote_other' -%}
+        {%- if remote_press in g[1] -%}
+          {%- set ns.kind = g[0] -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.kind }}
     {%- elif idx < fixed_trigger_count -%}
       {{ trigger.id }}
     {%- else -%}

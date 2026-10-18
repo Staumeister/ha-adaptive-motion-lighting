@@ -7,10 +7,14 @@ triggers, variables, conditions and actions with HA-like semantics:
   (literal_eval, so a bare `false` stays the string "false"), sequential
   variable rendering, and an immutable sandbox like HA's.
 * A state machine with last_changed and contexts (id/parent_id/user_id),
-  service calls that write states with the run's context.
+  service calls that write states with the run's context, and a minimal
+  device registry (device_attr, device_entities, device_id).
 * State triggers (to / not_to / match-all, `for:` timers that cancel when
   the state changes), template triggers (fire on false -> true, never at
-  setup), time triggers, nested button trigger lists with `trigger.idx`.
+  setup), time triggers, event triggers (event_data subset match), MQTT
+  triggers (`+`/`#` wildcards), nested button trigger lists with `trigger.idx`.
+* `enabled:` (bool or limited template) evaluated once at setup; disabled
+  triggers keep their position, so `trigger.idx` does not shift.
 * mode: restart: a run that passes conditions cancels a running one.
 
 It is not Home Assistant. It exists to exercise the decision logic and catch
@@ -145,11 +149,23 @@ def _parse_result(text: str) -> Any:
     return result
 
 
+def _topic_matches(subscription: str, topic: str) -> bool:
+    """MQTT topic filter with `+` (one level) and `#` (the rest)."""
+    sub, parts = subscription.split("/"), topic.split("/")
+    for i, level in enumerate(sub):
+        if level == "#":
+            return True
+        if i >= len(parts) or (level != "+" and level != parts[i]):
+            return False
+    return len(sub) == len(parts)
+
+
 class Sim:
     """Runs one blueprint automation."""
 
     def __init__(self, inputs: dict, *, start: datetime, states: dict | None = None,
-                 scenes: dict | None = None, sun_elevation: float = -10.0) -> None:
+                 scenes: dict | None = None, sun_elevation: float = -10.0,
+                 devices: dict | None = None) -> None:
         self.bp = load_blueprint()
         defs = input_definitions(self.bp)
         missing = [k for k, d in defs.items() if "default" not in d and k not in inputs]
@@ -162,6 +178,8 @@ class Sim:
         self.now = start
         self.states: dict[str, State] = {}
         self.scenes = scenes or {}
+        # {device_id: {"name": ..., "model": ..., "entities": [...]}}
+        self.devices = devices or {}
         self.calls: list[tuple[str, dict, dict]] = []
         self.notifications: list[dict] = []
         self.runs: list[dict] = []  # every trigger that executed (passed conditions)
@@ -179,11 +197,17 @@ class Sim:
             state, attrs = value if isinstance(value, tuple) else (value, {})
             self.set(entity_id, state, attrs)
         self.trigger_vars = self._render_vars(self.config.get("trigger_variables", {}), {"this": self.this})
+        # Disabled triggers are skipped at setup but keep their index.
+        self.enabled = [self._truthy(self._render(t.get("enabled", True), self._trigger_scope()))
+                        for t in self.triggers]
+        # Event data / MQTT topics are limited templates rendered once at setup.
+        self.attached = {idx: self._render({k: v for k, v in t.items() if k in ("event_data", "topic")},
+                                           self._trigger_scope())
+                         for idx, t in enumerate(self.triggers) if self.enabled[idx]}
         self.template_armed = {}
-        for idx, trig in enumerate(self.triggers):
-            if trig["trigger"] == "template":
-                # Template triggers never fire if already true at setup.
-                self.template_armed[idx] = not self._truthy(self._render(trig["value_template"], self._trigger_scope()))
+        for idx, trig in self._active("template"):
+            # Template triggers never fire if already true at setup.
+            self.template_armed[idx] = not self._truthy(self._render(trig["value_template"], self._trigger_scope()))
 
     # -------------------------------------------------------------- template env
     def _make_env(self):
@@ -255,10 +279,21 @@ class Sim:
                         out.append(sim.states[e])
             return out
 
+        def device_attr(device_id, attr):
+            return sim.devices.get(device_id, {}).get(attr)
+
+        def device_entities(device_id):
+            return list(sim.devices.get(device_id, {}).get("entities", []))
+
+        def device_id(entity_id):
+            return next((d for d, info in sim.devices.items() if entity_id in info.get("entities", [])), None)
+
         env.globals.update(states=AllStates(), is_state=is_state, state_attr=state_attr,
                            is_state_attr=is_state_attr, has_value=has_value,
-                           now=lambda: sim.now, as_timestamp=as_timestamp, expand=expand)
-        env.filters.update(float=_float, int=_int, as_timestamp=as_timestamp)
+                           now=lambda: sim.now, as_timestamp=as_timestamp, expand=expand,
+                           device_attr=device_attr, device_entities=device_entities, device_id=device_id)
+        env.filters.update(float=_float, int=_int, as_timestamp=as_timestamp, device_attr=device_attr,
+                           device_entities=device_entities, device_id=device_id)
         env.tests.update(is_state=is_state, is_state_attr=is_state_attr, has_value=has_value,
                          match=lambda value, pattern: bool(re.match(pattern, str(value))))
         return env
@@ -317,6 +352,24 @@ class Sim:
         """A device reports a change that did not come from HA."""
         return self.set(entity_id, state, attrs, context=Context(), keep_attrs=True)
 
+    def _active(self, platform):
+        return [(idx, t) for idx, t in enumerate(self.triggers)
+                if t["trigger"] == platform and self.enabled[idx]]
+
+    def fire_event(self, event_type: str, data: dict):
+        """Fire an event on the bus (e.g. a zha_event from a remote)."""
+        for idx, trig in self._active("event"):
+            wanted = self.attached[idx].get("event_data", {})
+            if trig["event_type"] == event_type and all(data.get(k) == v for k, v in wanted.items()):
+                self._fire(idx, {"platform": "event", "event": {"event_type": event_type, "data": data}},
+                           Context())
+
+    def mqtt(self, topic: str, payload: str):
+        """Receive an MQTT message."""
+        for idx, _trig in self._active("mqtt"):
+            if _topic_matches(self.attached[idx]["topic"], topic):
+                self._fire(idx, {"platform": "mqtt", "topic": topic, "payload": payload}, Context())
+
     def press(self, group: str):
         """Fire the first trigger of a button input (button_on, button_off...)."""
         offset = None
@@ -337,9 +390,7 @@ class Sim:
         return groups[order.index(group)]
 
     def _on_state_changed(self, entity_id, old, new):
-        for idx, trig in enumerate(self.triggers):
-            if trig["trigger"] != "state":
-                continue
+        for idx, trig in self._active("state"):
             ids = trig["entity_id"]
             ids = ids if isinstance(ids, list) else [ids]
             if entity_id not in ids:
@@ -377,14 +428,14 @@ class Sim:
             return False
         if "from" in trig and not match(old_v, trig["from"]):
             return False
+        if "not_from" in trig and match(old_v, trig["not_from"]):
+            return False
         if has_filter and old_v == new_v:
             return False
         return True
 
     def _check_templates(self):
-        for idx, trig in enumerate(self.triggers):
-            if trig["trigger"] != "template":
-                continue
+        for idx, trig in self._active("template"):
             value = self._truthy(self._render(trig["value_template"], self._trigger_scope()))
             if not value:
                 self.template_armed[idx] = True
@@ -409,14 +460,13 @@ class Sim:
                     self._fire(t["idx"], t["data"], t["context"])
                 else:
                     self._resume(t)
-            for idx, trig in enumerate(self.triggers):
-                if trig["trigger"] == "time":
-                    for at in trig["at"]:
-                        h, m, s = (int(x) for x in at.split(":"))
-                        target = self.now.replace(hour=h, minute=m, second=s, microsecond=0)
-                        if prev < target <= self.now:
-                            self._fire(idx, {"platform": "time", "now": self.now}, None)
-                            break
+            for idx, trig in self._active("time"):
+                for at in trig["at"]:
+                    h, m, s = (int(x) for x in at.split(":"))
+                    target = self.now.replace(hour=h, minute=m, second=s, microsecond=0)
+                    if prev < target <= self.now:
+                        self._fire(idx, {"platform": "time", "now": self.now}, None)
+                        break
             if prev.minute != self.now.minute or prev.hour != self.now.hour:
                 self._check_templates()  # now() templates re-render once per minute
 
@@ -427,12 +477,10 @@ class Sim:
         self.now += timedelta(seconds=downtime)
         for s in self.states.values():
             s.last_changed = s.last_updated = self.now
-        for idx, trig in enumerate(self.triggers):
-            if trig["trigger"] == "template":
-                self.template_armed[idx] = not self._truthy(self._render(trig["value_template"], self._trigger_scope()))
-        for idx, trig in enumerate(self.triggers):
-            if trig["trigger"] == "homeassistant":
-                self._fire(idx, {"platform": "homeassistant", "event": "start"}, None)
+        for idx, trig in self._active("template"):
+            self.template_armed[idx] = not self._truthy(self._render(trig["value_template"], self._trigger_scope()))
+        for idx, _trig in self._active("homeassistant"):
+            self._fire(idx, {"platform": "homeassistant", "event": "start"}, None)
 
     # -------------------------------------------------------------------- runs
     def _fire(self, idx: int, data: dict, ctx: Context | None):

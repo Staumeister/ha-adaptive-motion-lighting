@@ -1,6 +1,6 @@
 # Adaptive Motion Lighting with Manual Override
 
-**Version 1.0.0** · Home Assistant **2024.10+** · MIT licence
+**Version 1.1.0** · Home Assistant **2024.10+** · MIT licence
 
 This Home Assistant blueprint gives you motion and presence lighting that never argues with you. Lights come on when you walk in and go off once the room is really empty. If you switch a light by hand, the automation stays out of the way until you have left.
 
@@ -14,7 +14,8 @@ This Home Assistant blueprint gives you motion and presence lighting that never 
   - `manual_on` / `manual_off`: you are in charge. Motion is ignored until the room is empty and/or a hold time has passed.
   - `paused`: no automatic control at all until you resume.
 - **Manual overrides can come from**:
-  - any remote or button (ZHA, Zigbee2MQTT, Hue, Matter, Shelly, …), chosen with HA's normal trigger picker;
+  - IKEA remotes paired with ZHA (TRÅDFRI, RODRET, SOMRIG, BILRESA): just pick them;
+  - any other remote or button (ZHA, Zigbee2MQTT, Hue, Matter, Shelly, …) through HA's normal triggers;
   - dashboard, app or voice changes made by a HA user, including dimming;
   - optionally, wall switches or bulb-bound remotes that change the light outside HA.
 - **Lighting profiles.** There is a default profile plus two optional ones (for example *Evening* and *Night*). A profile is chosen by a time window that may cross midnight and/or by entities such as a `schedule` helper, an `input_boolean` "night mode" or `sun.sun`. Each profile can set:
@@ -105,7 +106,35 @@ Whichever you choose, "empty" means empty for the full vacancy delay *since the 
 
 ### Connecting a remote or buttons
 
-Each button action (**Manual ON**, **OFF**, **TOGGLE**, **Resume AUTO**, **PAUSE**) is a list of ordinary Home Assistant triggers, so it works with any integration. You can add several triggers to one action, for example two remotes.
+There are two ways to connect buttons. You can use both together.
+
+**IKEA remotes paired with ZHA (no setup).** In **Buttons and remotes**, pick your remotes in **IKEA remotes paired with ZHA**. That's it: the buttons work straight away. Supported:
+
+- TRÅDFRI on/off switch (E1743)
+- TRÅDFRI remote control, round with 5 buttons (E1524/E1810)
+- RODRET (E2201)
+- SOMRIG (E2213)
+- BILRESA with buttons (E2489) and with scroll wheel (E2490), when paired with ZHA
+
+Zigbee2MQTT and Matter (BILRESA over Thread) are planned for a later version. Until then, connect them with triggers as described below.
+
+Default buttons:
+
+| Action | Button |
+| --- | --- |
+| Manual ON | I / ▲ / one dot / button 1 – press |
+| Manual OFF | O / ▼ / two dots / button 2 – press |
+| Manual TOGGLE | Centre button of the round remote, or the BILRESA scroll wheel – press |
+| Resume AUTO | I / ▲ / one dot / button 1 – long press |
+| PAUSE | O / ▼ / two dots / button 2 – long press |
+
+To change them, pick other presses from each action's dropdown, including double presses, long presses and the round remote's ◀ ▶ buttons. You can pick several per action. Presses you don't assign are ignored.
+
+Note:
+
+- **BILRESA with scroll wheel:** pressing the wheel sends *on* and *off* alternately; both count as the centre button press. Turning the wheel does nothing here.
+
+**Other remotes: triggers.** Each action (**Manual ON**, **OFF**, **TOGGLE**, **Resume AUTO**, **PAUSE**) also takes a list of ordinary Home Assistant triggers, so any remote from any integration works. You can add several triggers to one action, for example two remotes.
 
 In the blueprint form, the trigger picker may not offer button triggers such as *"First button short press"*. If not, build the trigger in an empty automation and copy it over:
 
@@ -204,6 +233,11 @@ The simulator is not Home Assistant. Before a release, also import the blueprint
 - Never output a bare `true` / `false` from a variable. HA keeps that as a (truthy) string, so use `{{ false }}`. A test enforces this too.
 
 ## Changelog
+
+**1.1.0**
+
+- IKEA remotes paired with ZHA (TRÅDFRI on/off switch, TRÅDFRI round remote, RODRET, SOMRIG, BILRESA) can be picked directly. Their buttons work straight away, and dropdowns let you change what each press does. No YAML needed.
+- The existing trigger inputs are unchanged, so current automations keep working. After updating, the default buttons only apply once you pick a remote.
 
 **1.0.0** is the first public release.
 
