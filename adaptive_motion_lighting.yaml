@@ -1,0 +1,1153 @@
+# Adaptive Motion Lighting with Manual Override
+# Version: 1.0.0
+# Home Assistant: 2024.10.0+
+# License: MIT (see LICENSE)
+#
+# Architecture (read this before editing):
+#   * Every run is a short, stateless "decide, then act" pass. The `plan`
+#     variable decides what to do from the trigger and the current state; the
+#     actions only execute that plan. All persistent state lives in the mode
+#     helper (and the optional hold helper), so restarts and reloads are safe.
+#   * mode: restart. The top-level condition drops every run whose plan is
+#     empty, so only meaningful events can interrupt the single long-running
+#     step (the dim-before-off warning). Self-caused light/helper changes are
+#     recognised through `this.context.id` and ignored.
+#   * Precise `for:` state triggers handle normal switch-off; a template
+#     watchdog plus start/reload triggers recover anything a restart dropped.
+#   * The order of the fixed triggers matters: user button triggers are
+#     appended after them and identified by `trigger.idx`.
+#     Keep `fixed_trigger_count` in sync with the fixed trigger list.
+
+blueprint:
+  name: Adaptive Motion Lighting with Manual Override
+  author: Staumeister
+  description: >
+    Motion and presence lighting that respects people.
+
+
+    **What it does**
+
+    * Turns lights on with motion (optionally only when dark, by sun elevation
+    or an illuminance sensor) and off once **all** sensors have been clear
+    for the vacancy delay, with an optional dim-before-off warning.
+
+    * **Manual override**: buttons, dashboard changes or (optionally) wall
+    switches put the room into *manual on* / *manual off*. Motion is ignored
+    until the room is empty again (and/or a hold time has passed). *Paused*
+    disables automation until you return to *auto*.
+
+    * **Lighting profiles**: a default profile plus two optional profiles
+    (e.g. Evening, Night) selected by time window and/or helper entities such
+    as a `schedule`, an `input_boolean` or `sun.sun`. Each profile can use
+    its own lights, brightness, colour temperature, scenes, vacancy delay,
+    and can disable automatic switch-on.
+
+    * Works with any remote: pick button triggers from any integration
+    (ZHA, Zigbee2MQTT, Hue, Matter, ...).
+
+
+    **Required helper**: a Dropdown (`input_select`) with the options
+    `auto`, `manual_on`, `manual_off`, `paused` (case and spaces don't matter,
+    so `Manual on` works too). Use one helper per automation.
+  source_url: https://github.com/Staumeister/ha-adaptive-motion-lighting/blob/main/adaptive_motion_lighting.yaml
+  domain: automation
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    core:
+      name: Lights, sensors and mode helper
+      icon: mdi:lightbulb-auto
+      input:
+        occupancy_sensors:
+          name: Motion / occupancy sensors
+          description: >
+            One or more binary sensors (motion, occupancy, presence, door...).
+            The room counts as occupied while any of them is `on`.
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: binary_sensor
+                - domain: input_boolean
+        lights:
+          name: Lights
+          description: >
+            Lights, light groups or switches controlled by this automation.
+            Profiles may substitute their own set of lights.
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: light
+                - domain: switch
+        mode_helper:
+          name: Mode helper (input_select)
+          description: >
+            Options: `auto`, `manual_on`, `manual_off`, `paused`. Add it to a
+            dashboard to see or change the mode. One helper per automation.
+          selector:
+            entity:
+              filter:
+                - domain: input_select
+        hold_helper:
+          name: Hold-until helper (optional input_datetime)
+          description: >
+            Optional `input_datetime` with date **and** time. When set, every
+            manual action restarts the minimum hold time. Without it, the hold
+            is counted from the moment the mode last changed.
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: input_datetime
+
+    timing:
+      name: Vacancy and switch-off
+      icon: mdi:timer-outline
+      input:
+        vacancy_delay:
+          name: Vacancy delay
+          description: >
+            How long every sensor must be clear before the room counts as
+            empty. PIR sensors: 180–420 s. mmWave presence sensors: 30–120 s.
+          default: 300
+          selector:
+            number:
+              min: 0
+              max: 7200
+              step: 5
+              unit_of_measurement: s
+              mode: box
+        warn_seconds:
+          name: Dim-before-off warning
+          description: >
+            Dim the lights for this long before switching them off, so anyone
+            still there can wave to keep them on. 0 disables the warning.
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 300
+              step: 5
+              unit_of_measurement: s
+              mode: box
+        warn_brightness:
+          name: Warning brightness
+          description: Brightness during the warning (lights never get brighter).
+          default: 20
+          selector:
+            number:
+              min: 1
+              max: 100
+              unit_of_measurement: "%"
+        transition:
+          name: Transition
+          description: Fade time for on/off/dim. 0 sends no transition (best for bulbs that handle fades poorly).
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 30
+              step: 0.5
+              unit_of_measurement: s
+              mode: box
+        keep_awake_entities:
+          name: Keep-awake entities (optional)
+          description: >
+            While any of these is active (`on`, `playing`, `home`), the room
+            counts as occupied and lights stay on. Example: a TV media player,
+            a PC power plug, a bed-occupancy sensor. They never switch lights on.
+          default: []
+          selector:
+            entity:
+              multiple: true
+        unavailable_policy:
+          name: Unavailable occupancy sensors
+          description: >
+            What an `unknown`/`unavailable` occupancy sensor means. "Occupied"
+            is fail-safe (lights never go off on you) but a dead battery keeps
+            lights on until the sensor returns.
+          default: occupied
+          selector:
+            select:
+              options:
+                - label: Treat as occupied (keep lights on)
+                  value: occupied
+                - label: Ignore the sensor
+                  value: ignore
+
+    override:
+      name: Manual override
+      icon: mdi:hand-back-right
+      collapsed: true
+      input:
+        return_policy:
+          name: Return to auto
+          description: When a manual on/off override ends by itself.
+          default: hold_and_vacancy
+          selector:
+            select:
+              options:
+                - label: After the hold time AND once the room is empty (recommended)
+                  value: hold_and_vacancy
+                - label: Once the room is empty
+                  value: vacancy
+                - label: After the hold time, even if occupied
+                  value: hold
+                - label: Never (only via button or dashboard)
+                  value: never
+        hold_minutes:
+          name: Minimum hold time
+          description: >
+            Prevents a manual off from expiring while you are just sitting still
+            (e.g. watching TV or in bed).
+          default: 30
+          selector:
+            number:
+              min: 0
+              max: 1440
+              unit_of_measurement: min
+              mode: box
+        detect_ui_changes:
+          name: Detect changes made in Home Assistant
+          description: >
+            Switching or dimming a light from a dashboard, the app or a voice
+            assistant tied to a HA user starts a manual override.
+          default: true
+          selector:
+            boolean: {}
+        detect_unattributed_changes:
+          name: Detect changes made outside Home Assistant (experimental)
+          description: >
+            Also treat on/off changes without any Home Assistant origin (a
+            smart wall switch, a remote bound directly to the bulb) as a manual
+            override. Test with your devices: some report spontaneous changes.
+          default: false
+          selector:
+            boolean: {}
+        pause_action:
+          name: When entering paused
+          default: keep
+          selector:
+            select:
+              options:
+                - label: Leave the lights as they are
+                  value: keep
+                - label: Turn the lights off
+                  value: "off"
+
+    buttons:
+      name: Buttons and remotes (optional)
+      icon: mdi:remote
+      collapsed: true
+      input:
+        button_on:
+          name: Manual ON
+          description: Lights on with the current profile and start manual on. Inside paused, only switches the lights.
+          default: []
+          selector:
+            trigger: {}
+        button_off:
+          name: Manual OFF
+          description: Lights off and start manual off. Inside paused, only switches the lights.
+          default: []
+          selector:
+            trigger: {}
+        button_toggle:
+          name: Manual TOGGLE
+          description: Acts as Manual ON when all lights are off, otherwise as Manual OFF.
+          default: []
+          selector:
+            trigger: {}
+        button_auto:
+          name: Resume AUTO
+          description: Return to auto and immediately apply what auto would do now.
+          default: []
+          selector:
+            trigger: {}
+        button_pause:
+          name: PAUSE
+          description: Stop all automatic control until auto is resumed.
+          default: []
+          selector:
+            trigger: {}
+
+    conditions:
+      name: When lights may switch on automatically
+      icon: mdi:weather-night
+      collapsed: true
+      input:
+        lux_sensor:
+          name: Illuminance sensor (optional)
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: sensor
+                  device_class: illuminance
+        lux_threshold:
+          name: Only switch on below
+          description: Only checked while the lights are off, so their own light does not interfere.
+          default: 50
+          selector:
+            number:
+              min: 0
+              max: 5000
+              step: 5
+              unit_of_measurement: lx
+              mode: box
+        missing_lux_policy:
+          name: When the illuminance sensor is unavailable
+          default: allow
+          selector:
+            select:
+              options:
+                - label: Allow switching on (never leave the room dark)
+                  value: allow
+                - label: Block switching on
+                  value: block
+        sun_mode:
+          name: Sun elevation
+          default: always
+          selector:
+            select:
+              options:
+                - label: Ignore the sun
+                  value: always
+                - label: Only when the sun is below the threshold
+                  value: below
+                - label: Only when the sun is above the threshold
+                  value: above
+        sun_elevation:
+          name: Sun elevation threshold
+          description: "0° = sunset/sunrise; -6° = end of civil twilight; 5–10° ≈ late afternoon dimness."
+          default: 3
+          selector:
+            number:
+              min: -18
+              max: 45
+              unit_of_measurement: "°"
+              mode: box
+        blocking_entities:
+          name: Blocking entities (optional)
+          description: >
+            No automatic switch-on while any of these is active (`on`,
+            `playing`, `home`), e.g. a "guest sleeping" or "movie mode"
+            `input_boolean`. Switch-off still works.
+          default: []
+          selector:
+            entity:
+              multiple: true
+
+    default_profile:
+      name: Default lighting
+      icon: mdi:lightbulb-on-outline
+      input:
+        default_auto_on:
+          name: Motion switches lights on
+          description: Turn off for vacancy-only behaviour (manual on, automatic off).
+          default: true
+          selector:
+            boolean: {}
+        default_brightness:
+          name: Brightness
+          description: 0 = do not set (the light keeps its last brightness).
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 100
+              unit_of_measurement: "%"
+        default_color_temp:
+          name: Colour temperature
+          description: 0 = do not set. Ignored by lights without colour temperature.
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 6500
+              step: 50
+              unit_of_measurement: K
+              mode: box
+        default_scene:
+          name: Scene instead of brightness (optional)
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: scene
+        default_idle_scene:
+          name: Vacant-room scene (optional)
+          description: >
+            Applied instead of switching off when the room becomes empty
+            (e.g. a 5 % ambient glow). Manual overrides always end with lights off.
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: scene
+        profile_refresh:
+          name: Apply profile changes to lights that are on
+          description: >
+            When another profile becomes active while lights are on in auto
+            (e.g. Night starts at 23:00), re-apply the lighting immediately.
+          default: true
+          selector:
+            boolean: {}
+
+    profile_1:
+      name: Profile 1 (optional, e.g. Evening)
+      icon: mdi:weather-sunset
+      collapsed: true
+      input:
+        p1_from: &profile_from
+          name: Active from
+          description: Leave "from" equal to "until" to ignore time. Windows may cross midnight.
+          default: "00:00:00"
+          selector:
+            time: {}
+        p1_until: &profile_until
+          name: Active until
+          default: "00:00:00"
+          selector:
+            time: {}
+        p1_entities: &profile_entities
+          name: Active while any of these is on (optional)
+          description: >
+            E.g. a `schedule` helper, an `input_boolean` such as "night mode",
+            or `sun.sun` (active below the horizon). Combined with the time
+            window using AND. Configure a time window and/or entities to enable
+            this profile.
+          default: []
+          selector:
+            entity:
+              multiple: true
+        p1_lights: &profile_lights
+          name: Lights for this profile (optional)
+          description: Leave empty to use the main lights. Lights not listed are switched off when this profile switches on.
+          default: []
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - domain: light
+                - domain: switch
+        p1_auto_on: &profile_auto_on
+          name: Motion switches lights on
+          default: true
+          selector:
+            boolean: {}
+        p1_brightness: &profile_brightness
+          name: Brightness
+          description: 0 = do not set.
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 100
+              unit_of_measurement: "%"
+        p1_color_temp: &profile_color_temp
+          name: Colour temperature
+          description: 0 = do not set.
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 6500
+              step: 50
+              unit_of_measurement: K
+              mode: box
+        p1_scene: &profile_scene
+          name: Scene instead of brightness (optional)
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: scene
+        p1_idle_scene: &profile_idle_scene
+          name: Vacant-room scene (optional)
+          default: ""
+          selector:
+            entity:
+              filter:
+                - domain: scene
+        p1_vacancy_delay: &profile_vacancy_delay
+          name: Vacancy delay
+          description: 0 = use the main vacancy delay.
+          default: 0
+          selector:
+            number:
+              min: 0
+              max: 7200
+              step: 5
+              unit_of_measurement: s
+              mode: box
+
+    profile_2:
+      name: Profile 2 (optional, e.g. Night – wins over profile 1)
+      icon: mdi:weather-night
+      collapsed: true
+      input:
+        p2_from: *profile_from
+        p2_until: *profile_until
+        p2_entities: *profile_entities
+        p2_lights: *profile_lights
+        p2_auto_on: *profile_auto_on
+        p2_brightness: *profile_brightness
+        p2_color_temp: *profile_color_temp
+        p2_scene: *profile_scene
+        p2_idle_scene: *profile_idle_scene
+        p2_vacancy_delay: *profile_vacancy_delay
+
+mode: restart
+max_exceeded: silent
+
+# Static inputs used inside triggers (limited templates only, no states()).
+trigger_variables:
+  occupancy_sensors: !input occupancy_sensors
+  keep_awake_entities: !input keep_awake_entities
+  lights: !input lights
+  mode_helper: !input mode_helper
+  hold_helper: !input hold_helper
+  vacancy_delay: !input vacancy_delay
+  warn_seconds: !input warn_seconds
+  unavailable_policy: !input unavailable_policy
+  return_policy: !input return_policy
+  hold_minutes: !input hold_minutes
+  p1_from: !input p1_from
+  p1_until: !input p1_until
+  p1_entities: !input p1_entities
+  p1_lights: !input p1_lights
+  p1_vacancy_delay: !input p1_vacancy_delay
+  p2_from: !input p2_from
+  p2_until: !input p2_until
+  p2_entities: !input p2_entities
+  p2_lights: !input p2_lights
+  p2_vacancy_delay: !input p2_vacancy_delay
+
+triggers:
+  # --- fixed triggers: keep in sync with fixed_trigger_count (13) ---------
+  - trigger: state # 0
+    id: occupied
+    entity_id: !input occupancy_sensors
+    to: "on"
+
+  - trigger: state # 1
+    id: vacant
+    entity_id: !input occupancy_sensors
+    not_to: ["on", "unknown", "unavailable"]
+    for:
+      # Vacancy delay of the profile active when the sensor cleared.
+      # Same profile selection as the `profile` variable below.
+      seconds: &vacancy_delay_template >-
+        {%- set t = now().strftime('%H:%M:%S') -%}
+        {%- set ns = namespace(id='default') -%}
+        {%- for p in [[p1_from, p1_until, p1_entities, 'p1'],
+                      [p2_from, p2_until, p2_entities, 'p2']] -%}
+          {%- set f, u, ents = p[0], p[1], p[2] -%}
+          {%- set has_window = f != u -%}
+          {%- set in_window = (f < u and f <= t < u) or (f > u and (t >= f or t < u)) -%}
+          {%- set has_ents = ents | count > 0 -%}
+          {%- set ents_on = ents | select('is_state', ['on', 'home', 'below_horizon']) | list | count > 0 -%}
+          {%- if (has_window or has_ents) and (in_window or not has_window)
+                 and (ents_on or not has_ents) -%}
+            {%- set ns.id = p[3] -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {{ {'default': vacancy_delay,
+            'p1': p1_vacancy_delay or vacancy_delay,
+            'p2': p2_vacancy_delay or vacancy_delay}[ns.id] | float(0) }}
+
+  - trigger: state # 2
+    id: vacant
+    entity_id: !input keep_awake_entities
+    to: ~
+    for:
+      seconds: *vacancy_delay_template
+
+  # Watchdog: fires (false -> true) once something is overdue. Covers lost
+  # `for:` timers after restarts/reloads, hold expiry, and lights switched on
+  # in auto while the room is empty. Uses the longest possible delay.
+  - trigger: template # 3
+    id: watchdog
+    value_template: >-
+      {%- set act = ['on', 'playing', 'home'] -%}
+      {%- set m = states(mode_helper) | lower | replace(' ', '_') | replace('-', '_') -%}
+      {%- set ns = namespace(occupied=false, latest=0) -%}
+      {%- for e in occupancy_sensors + keep_awake_entities -%}
+        {%- set s = states(e) -%}
+        {%- if s in ['unknown', 'unavailable'] -%}
+          {%- if e in occupancy_sensors and unavailable_policy == 'occupied' -%}
+            {%- set ns.occupied = true -%}
+          {%- endif -%}
+        {%- elif s in act -%}
+          {%- set ns.occupied = true -%}
+        {%- else -%}
+          {%- set ns.latest = [ns.latest, as_timestamp(states[e].last_changed, 0)] | max -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- set vacant_for = 0 if ns.occupied else as_timestamp(now()) - ns.latest -%}
+      {%- set max_delay = [vacancy_delay, p1_vacancy_delay, p2_vacancy_delay] | max -%}
+      {%- set vacant = vacant_for >= max_delay -%}
+      {%- if m in ['manual_on', 'manual_off'] -%}
+        {#- The room must also have been empty since the override started. -#}
+        {%- set started = [as_timestamp(states[mode_helper].last_changed, 0),
+                           as_timestamp(states[hold_helper].last_changed, 0) if hold_helper and states[hold_helper] else 0] | max -%}
+        {%- set vacant = vacant and as_timestamp(now()) - started >= max_delay -%}
+        {%- set deadline = state_attr(hold_helper, 'timestamp') if hold_helper else none -%}
+        {%- if deadline is number -%}
+          {%- set hold_done = as_timestamp(now()) >= deadline -%}
+        {%- else -%}
+          {%- set hold_done = as_timestamp(now()) - as_timestamp(states[mode_helper].last_changed, 0)
+                              >= hold_minutes * 60 -%}
+        {%- endif -%}
+        {{ (return_policy == 'vacancy' and vacant)
+           or (return_policy == 'hold_and_vacancy' and vacant and hold_done)
+           or (return_policy == 'hold' and hold_done) }}
+      {%- elif m == 'paused' -%}
+        {{ false }}
+      {%- else -%}
+        {#- Lights left on in an empty room, for at least the delay. -#}
+        {%- set on = (lights + p1_lights + p2_lights) | select('is_state', 'on') | list -%}
+        {%- set ln = namespace(latest=0) -%}
+        {%- for l in on -%}
+          {%- set ln.latest = [ln.latest, as_timestamp(states[l].last_changed, 0)] | max -%}
+        {%- endfor -%}
+        {{ on | count > 0 and vacant_for >= max_delay + warn_seconds
+           and as_timestamp(now()) - ln.latest >= max_delay + warn_seconds }}
+      {%- endif -%}
+
+  - trigger: homeassistant # 4
+    id: started
+    event: start
+
+  - trigger: event # 5
+    id: started
+    event_type: automation_reloaded
+
+  - trigger: state # 6
+    id: light_changed
+    entity_id: !input lights
+
+  - trigger: state # 7
+    id: light_changed
+    entity_id: !input p1_lights
+
+  - trigger: state # 8
+    id: light_changed
+    entity_id: !input p2_lights
+
+  - trigger: state # 9
+    id: mode_changed
+    entity_id: !input mode_helper
+    to: ~
+
+  - trigger: time # 10
+    id: profile_changed
+    at:
+      - !input p1_from
+      - !input p1_until
+      - !input p2_from
+      - !input p2_until
+
+  - trigger: state # 11
+    id: profile_changed
+    entity_id: !input p1_entities
+    to: ~
+
+  - trigger: state # 12
+    id: profile_changed
+    entity_id: !input p2_entities
+    to: ~
+
+  # --- user button triggers, identified by trigger.idx -------------------
+  - triggers: !input button_on
+  - triggers: !input button_off
+  - triggers: !input button_toggle
+  - triggers: !input button_auto
+  - triggers: !input button_pause
+
+variables:
+  # --- inputs ---------------------------------------------------------------
+  occupancy_sensors: !input occupancy_sensors
+  keep_awake_entities: !input keep_awake_entities
+  lights: !input lights
+  mode_helper: !input mode_helper
+  hold_helper: !input hold_helper
+  vacancy_delay: !input vacancy_delay
+  warn_seconds: !input warn_seconds
+  warn_brightness: !input warn_brightness
+  transition: !input transition
+  unavailable_policy: !input unavailable_policy
+  return_policy: !input return_policy
+  hold_minutes: !input hold_minutes
+  detect_ui_changes: !input detect_ui_changes
+  detect_unattributed_changes: !input detect_unattributed_changes
+  pause_action: !input pause_action
+  lux_sensor: !input lux_sensor
+  lux_threshold: !input lux_threshold
+  missing_lux_policy: !input missing_lux_policy
+  sun_mode: !input sun_mode
+  sun_elevation: !input sun_elevation
+  blocking_entities: !input blocking_entities
+  profile_refresh: !input profile_refresh
+  p1_from: !input p1_from
+  p1_until: !input p1_until
+  p1_entities: !input p1_entities
+  p1_lights: !input p1_lights
+  p1_vacancy_delay: !input p1_vacancy_delay
+  p2_from: !input p2_from
+  p2_until: !input p2_until
+  p2_entities: !input p2_entities
+  p2_lights: !input p2_lights
+  p2_vacancy_delay: !input p2_vacancy_delay
+  profiles:
+    default:
+      lights: !input lights
+      auto_on: !input default_auto_on
+      brightness: !input default_brightness
+      color_temp: !input default_color_temp
+      scene: !input default_scene
+      idle_scene: !input default_idle_scene
+    p1:
+      lights: !input p1_lights
+      auto_on: !input p1_auto_on
+      brightness: !input p1_brightness
+      color_temp: !input p1_color_temp
+      scene: !input p1_scene
+      idle_scene: !input p1_idle_scene
+    p2:
+      lights: !input p2_lights
+      auto_on: !input p2_auto_on
+      brightness: !input p2_brightness
+      color_temp: !input p2_color_temp
+      scene: !input p2_scene
+      idle_scene: !input p2_idle_scene
+  button_groups:
+    - [button_on, !input button_on]
+    - [button_off, !input button_off]
+    - [button_toggle, !input button_toggle]
+    - [button_auto, !input button_auto]
+    - [button_pause, !input button_pause]
+  fixed_trigger_count: 13
+
+  # --- what happened ------------------------------------------------------
+  event: >-
+    {%- set idx = (trigger.idx | int(-1)) if trigger is defined and trigger.idx is defined else -1 -%}
+    {%- if idx < 0 -%}
+      started
+    {%- elif idx < fixed_trigger_count -%}
+      {{ trigger.id }}
+    {%- else -%}
+      {%- set ns = namespace(i=idx - fixed_trigger_count, kind='unknown') -%}
+      {%- for g in button_groups -%}
+        {%- if ns.kind == 'unknown' -%}
+          {%- if ns.i < g[1] | count -%}
+            {%- set ns.kind = g[0] -%}
+          {%- else -%}
+            {%- set ns.i = ns.i - g[1] | count -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.kind }}
+    {%- endif -%}
+  self_caused: >-
+    {{ trigger is defined and trigger.to_state is defined and trigger.to_state is not none
+       and this is not none and this.context is defined
+       and trigger.to_state.context.id == this.context.id }}
+
+  # --- current state --------------------------------------------------------
+  mode_options: >-
+    {%- set ns = namespace(map={}) -%}
+    {%- for o in state_attr(mode_helper, 'options') or [] -%}
+      {%- set key = o | lower | replace(' ', '_') | replace('-', '_') -%}
+      {%- if key not in ns.map -%}
+        {%- set ns.map = dict(ns.map, **{key: o}) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {{ ns.map }}
+  mode: >-
+    {%- set m = states(mode_helper) | lower | replace(' ', '_') | replace('-', '_') -%}
+    {{ m if m in ['auto', 'manual_on', 'manual_off', 'paused'] else 'auto' }}
+  config_errors: >-
+    {%- set ns = namespace(errors=[]) -%}
+    {%- set missing = ['auto', 'manual_on', 'manual_off', 'paused']
+                      | reject('in', mode_options) | list -%}
+    {%- if missing -%}
+      {%- set ns.errors = ns.errors + [mode_helper ~ ' is missing the option(s): ' ~ missing | join(', ')] -%}
+    {%- endif -%}
+    {%- if hold_helper and not (state_attr(hold_helper, 'has_date') and state_attr(hold_helper, 'has_time')) -%}
+      {%- set ns.errors = ns.errors + [hold_helper ~ ' needs both date and time enabled'] -%}
+    {%- endif -%}
+    {{ ns.errors }}
+  profile: >-
+    {%- set t = now().strftime('%H:%M:%S') -%}
+    {%- set ns = namespace(id='default') -%}
+    {%- for p in [[p1_from, p1_until, p1_entities, 'p1'],
+                  [p2_from, p2_until, p2_entities, 'p2']] -%}
+      {%- set f, u, ents = p[0], p[1], p[2] -%}
+      {%- set has_window = f != u -%}
+      {%- set in_window = (f < u and f <= t < u) or (f > u and (t >= f or t < u)) -%}
+      {%- set has_ents = ents | count > 0 -%}
+      {%- set ents_on = ents | select('is_state', ['on', 'home', 'below_horizon']) | list | count > 0 -%}
+      {%- if (has_window or has_ents) and (in_window or not has_window)
+             and (ents_on or not has_ents) -%}
+        {%- set ns.id = p[3] -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {{ ns.id }}
+  delay: *vacancy_delay_template
+  cfg: >-
+    {%- set c = profiles[profile] -%}
+    {{ dict(c, lights=c.lights or lights) }}
+  all_lights: "{{ (lights + p1_lights + p2_lights) | unique | list }}"
+  lights_on_now: "{{ all_lights | select('is_state', 'on') | list }}"
+  lights_on: "{{ lights_on_now | count > 0 }}"
+  # Seconds since the most recent light was switched on. Lights switched on
+  # while the room is empty (by hand, another automation) get a full delay
+  # before auto switches them off, so they don't race manual detection.
+  lights_on_for: >-
+    {%- set ns = namespace(latest=0) -%}
+    {%- for l in lights_on_now -%}
+      {%- set ns.latest = [ns.latest, as_timestamp(states[l].last_changed, 0)] | max -%}
+    {%- endfor -%}
+    {{ as_timestamp(now()) - ns.latest }}
+  occupancy: >-
+    {%- set act = ['on', 'playing', 'home'] -%}
+    {%- set ns = namespace(occupied=false, latest=0) -%}
+    {%- for e in occupancy_sensors + keep_awake_entities -%}
+      {%- set s = states(e) -%}
+      {%- if s in ['unknown', 'unavailable'] -%}
+        {%- if e in occupancy_sensors and unavailable_policy == 'occupied' -%}
+          {%- set ns.occupied = true -%}
+        {%- endif -%}
+      {%- elif s in act -%}
+        {%- set ns.occupied = true -%}
+      {%- else -%}
+        {%- set ns.latest = [ns.latest, as_timestamp(states[e].last_changed, 0)] | max -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {{ {'occupied': ns.occupied,
+        'vacant_for': 0 if ns.occupied else as_timestamp(now()) - ns.latest} }}
+  vacant: "{{ occupancy.vacant_for >= delay }}"
+  # For a new motion event: had the room been empty for the vacancy delay
+  # just before it? Then lights that are on are dimmed/idle and get restored.
+  was_vacant: >-
+    {%- if event != 'occupied' or trigger.from_state is none -%}
+      {{ false }}
+    {%- else -%}
+      {%- set act = ['on', 'playing', 'home'] -%}
+      {%- set ns = namespace(ok=trigger.from_state.state != 'on',
+                             latest=as_timestamp(trigger.from_state.last_changed, 0)) -%}
+      {%- for e in (occupancy_sensors + keep_awake_entities) | reject('eq', trigger.entity_id) -%}
+        {%- set s = states(e) -%}
+        {%- if s in act -%}
+          {%- set ns.ok = false -%}
+        {%- elif s not in ['unknown', 'unavailable'] -%}
+          {%- set ns.latest = [ns.latest, as_timestamp(states[e].last_changed, 0)] | max -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ ns.ok and as_timestamp(now()) - ns.latest >= delay }}
+    {%- endif -%}
+  hold_expired: >-
+    {%- set deadline = state_attr(hold_helper, 'timestamp') if hold_helper else none -%}
+    {%- if deadline is number -%}
+      {{ as_timestamp(now()) >= deadline }}
+    {%- else -%}
+      {{ as_timestamp(now()) - as_timestamp(states[mode_helper].last_changed, 0) >= hold_minutes * 60 }}
+    {%- endif -%}
+  # Seconds since the last manual action (mode change or hold restart).
+  override_age: >-
+    {{ as_timestamp(now()) - ([as_timestamp(states[mode_helper].last_changed, 0),
+        as_timestamp(states[hold_helper].last_changed, 0) if hold_helper and states[hold_helper] else 0] | max) }}
+  recovery_due: >-
+    {%- set vacant = vacant and override_age >= delay -%}
+    {{ (return_policy == 'vacancy' and vacant)
+       or (return_policy == 'hold_and_vacancy' and vacant and hold_expired)
+       or (return_policy == 'hold' and hold_expired) }}
+  auto_on_allowed: >-
+    {%- set elevation = state_attr('sun.sun', 'elevation') -%}
+    {%- set sun_ok = sun_mode == 'always' or (elevation is number and
+          ((sun_mode == 'below' and elevation < sun_elevation)
+           or (sun_mode == 'above' and elevation >= sun_elevation))) -%}
+    {%- set lux_ok = not lux_sensor
+          or (has_value(lux_sensor) and states(lux_sensor) | float(0) < lux_threshold)
+          or (not has_value(lux_sensor) and missing_lux_policy == 'allow') -%}
+    {%- set blocked = blocking_entities | select('is_state', ['on', 'playing', 'home']) | list | count > 0 -%}
+    {{ cfg.auto_on and sun_ok and lux_ok and not blocked }}
+  # What auto mode wants right now: on / off / idle / dim / none.
+  auto_target: >-
+    {%- if vacant -%}
+      {%- if not lights_on or lights_on_for < delay -%} none
+      {%- elif cfg.idle_scene -%} idle
+      {%- elif warn_seconds > 0 and occupancy.vacant_for < delay + warn_seconds -%} dim
+      {%- else -%} off
+      {%- endif -%}
+    {%- elif occupancy.occupied and not lights_on and auto_on_allowed -%} on
+    {%- else -%} none
+    {%- endif -%}
+  manual_change: >-
+    {%- set ts = trigger.to_state if event == 'light_changed' else none -%}
+    {%- set fs = trigger.from_state if event == 'light_changed' else none -%}
+    {%- if ts is none or self_caused or mode == 'paused' or ts.state not in ['on', 'off'] -%}
+      {{ false }}
+    {%- elif detect_ui_changes and ts.context.user_id is not none -%}
+      {{ true }}
+    {%- else -%}
+      {{ detect_unattributed_changes and ts.context.user_id is none
+         and ts.context.parent_id is none and fs is not none
+         and fs.state in ['on', 'off'] and fs.state != ts.state }}
+    {%- endif -%}
+
+  # --- the decision ---------------------------------------------------------
+  # mode: new mode ('' = keep); hold: restart hold timer;
+  # lights: on | off | idle | dim | none; why: shown in traces.
+  plan: >-
+    {%- set p = namespace(mode='', hold=false, lights='none', why='nothing to do') -%}
+    {%- set e = event -%}
+    {%- if e == 'button_toggle' -%}
+      {%- set e = 'button_off' if lights_on else 'button_on' -%}
+    {%- endif -%}
+
+    {%- if config_errors -%}
+      {%- set p.why = 'configuration error' -%}
+
+    {%- elif e == 'occupied' -%}
+      {%- if mode == 'auto' and not lights_on and auto_on_allowed -%}
+        {%- set p.lights = 'on' -%}
+        {%- set p.why = 'motion' -%}
+      {%- elif mode == 'auto' and lights_on and was_vacant -%}
+        {%- set p.lights = 'on' -%}
+        {%- set p.why = 'motion after vacancy: restore lighting' -%}
+      {%- endif -%}
+
+    {%- elif e in ['vacant', 'watchdog', 'started'] -%}
+      {%- if mode in ['manual_on', 'manual_off'] and recovery_due -%}
+        {%- set p.mode = 'auto' -%}
+        {%- set p.why = 'manual override ended' -%}
+        {%- set p.lights = 'off' if vacant and lights_on else 'none' -%}
+      {%- elif mode == 'auto' and auto_target in ['off', 'idle', 'dim'] -%}
+        {%- set p.lights = auto_target -%}
+        {%- set p.why = 'room vacant' -%}
+      {%- endif -%}
+
+    {%- elif e == 'profile_changed' -%}
+      {#- Unused time windows still create a (harmless) 00:00 time trigger. -#}
+      {%- set dummy_time = trigger.platform == 'time'
+            and p1_from == p1_until and p2_from == p2_until -%}
+      {%- if mode == 'auto' and lights_on and not dummy_time -%}
+        {%- if auto_target in ['off', 'idle', 'dim'] -%}
+          {%- set p.lights = auto_target -%}
+          {%- set p.why = 'profile ' ~ profile ~ ' while vacant' -%}
+        {%- elif not vacant and profile_refresh -%}
+          {%- set p.lights = 'on' -%}
+          {%- set p.why = 'profile ' ~ profile ~ ' applied' -%}
+        {%- endif -%}
+      {%- endif -%}
+
+    {%- elif e == 'light_changed' -%}
+      {%- if manual_change -%}
+        {%- set p.mode = 'manual_on' if lights_on else 'manual_off' -%}
+        {%- set p.hold = true -%}
+        {%- set p.why = 'light changed by hand' -%}
+      {%- endif -%}
+
+    {%- elif e == 'mode_changed' -%}
+      {%- if not self_caused and trigger.from_state is not none
+             and trigger.to_state is not none
+             and trigger.from_state.state != trigger.to_state.state -%}
+        {%- set p.why = 'mode set to ' ~ mode -%}
+        {%- if mode == 'manual_on' -%}
+          {%- set p.hold = true -%}
+          {%- set p.lights = 'none' if lights_on else 'on' -%}
+        {%- elif mode == 'manual_off' -%}
+          {%- set p.hold = true -%}
+          {%- set p.lights = 'off' if lights_on else 'none' -%}
+        {%- elif mode == 'paused' -%}
+          {%- set p.lights = 'off' if pause_action == 'off' and lights_on else 'none' -%}
+          {%- set p.why = p.why if p.lights == 'off' else 'nothing to do' -%}
+        {%- else -%}
+          {%- set p.lights = auto_target -%}
+          {%- set p.why = p.why if p.lights != 'none' else 'nothing to do' -%}
+        {%- endif -%}
+      {%- endif -%}
+
+    {%- elif e == 'button_on' -%}
+      {%- set p.lights = 'on' -%}
+      {%- set p.why = 'button on' -%}
+      {%- if mode != 'paused' -%}
+        {%- set p.mode = 'manual_on' -%}
+        {%- set p.hold = true -%}
+      {%- endif -%}
+
+    {%- elif e == 'button_off' -%}
+      {%- set p.lights = 'off' -%}
+      {%- set p.why = 'button off' -%}
+      {%- if mode != 'paused' -%}
+        {%- set p.mode = 'manual_off' -%}
+        {%- set p.hold = true -%}
+      {%- endif -%}
+
+    {%- elif e == 'button_auto' -%}
+      {%- set p.mode = 'auto' -%}
+      {%- set p.lights = auto_target -%}
+      {%- set p.why = 'button auto' -%}
+
+    {%- elif e == 'button_pause' -%}
+      {%- set p.mode = 'paused' -%}
+      {%- set p.why = 'button pause' -%}
+      {%- set p.lights = 'off' if pause_action == 'off' and lights_on else 'none' -%}
+    {%- endif -%}
+
+    {%- set p.mode = '' if p.mode == mode else p.mode -%}
+    {%- set p.hold = p.hold and p.mode != 'auto' -%}
+    {{ {'mode': p.mode, 'hold': p.hold, 'lights': p.lights, 'why': p.why,
+        'run': p.mode != '' or p.hold or p.lights != 'none'
+               or (config_errors | count > 0 and event in ['started', 'mode_changed'])} }}
+
+# Runs with nothing to do stop here, so they never interrupt a running warning.
+conditions:
+  - condition: template
+    value_template: "{{ plan.run }}"
+
+actions:
+  - if:
+      - condition: template
+        value_template: "{{ config_errors | count > 0 }}"
+    then:
+      - action: persistent_notification.create
+        data:
+          notification_id: "{{ 'adaptive_motion_lighting_' ~ (this.entity_id | default('config')) }}"
+          title: Adaptive Motion Lighting – configuration problem
+          message: >-
+            {{ this.attributes.friendly_name | default('Automation') }}:
+            {{ config_errors | join('; ') }}.
+      - stop: Configuration error
+
+  - if:
+      - condition: template
+        value_template: "{{ plan.hold and hold_helper != '' }}"
+    then:
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: "{{ hold_helper }}"
+        data:
+          timestamp: "{{ as_timestamp(now()) + hold_minutes * 60 }}"
+
+  - if:
+      - condition: template
+        value_template: "{{ plan.mode != '' }}"
+    then:
+      - action: input_select.select_option
+        target:
+          entity_id: "{{ mode_helper }}"
+        data:
+          option: "{{ mode_options[plan.mode] }}"
+
+  - choose:
+      - alias: Lights on with the active profile
+        conditions:
+          - condition: template
+            value_template: "{{ plan.lights == 'on' }}"
+        sequence:
+          - variables:
+              targets: "{{ cfg.lights }}"
+              light_data: >-
+                {%- set d = {} -%}
+                {%- if cfg.brightness | int(0) > 0 -%}{%- set d = dict(d, brightness_pct=cfg.brightness | int) -%}{%- endif -%}
+                {%- if cfg.color_temp | int(0) > 0 -%}{%- set d = dict(d, color_temp_kelvin=cfg.color_temp | int) -%}{%- endif -%}
+                {%- if transition | float(0) > 0 -%}{%- set d = dict(d, transition=transition | float) -%}{%- endif -%}
+                {{ d }}
+          - if:
+              - condition: template
+                value_template: "{{ cfg.scene != '' }}"
+            then:
+              - action: scene.turn_on
+                target:
+                  entity_id: "{{ cfg.scene }}"
+                data: "{{ {'transition': transition | float} if transition | float(0) > 0 else {} }}"
+            else:
+              - if:
+                  - condition: template
+                    value_template: "{{ targets | select('match', 'light\\.') | list | count > 0 }}"
+                then:
+                  - action: light.turn_on
+                    target:
+                      entity_id: "{{ targets | select('match', 'light\\.') | list }}"
+                    data: "{{ light_data }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ targets | select('match', 'switch\\.') | list | count > 0 }}"
+                then:
+                  - action: switch.turn_on
+                    target:
+                      entity_id: "{{ targets | select('match', 'switch\\.') | list }}"
+              # Lights of other profiles that are still on.
+              - variables:
+                  others: "{{ lights_on_now | reject('in', targets) | list }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ others | count > 0 }}"
+                then:
+                  - action: homeassistant.turn_off
+                    target:
+                      entity_id: "{{ others }}"
+
+      - alias: Vacant-room scene
+        conditions:
+          - condition: template
+            value_template: "{{ plan.lights == 'idle' }}"
+        sequence:
+          - action: scene.turn_on
+            target:
+              entity_id: "{{ cfg.idle_scene }}"
+            data: "{{ {'transition': transition | float} if transition | float(0) > 0 else {} }}"
+
+      - alias: Lights off (after an optional dim warning)
+        conditions:
+          - condition: template
+            value_template: "{{ plan.lights in ['off', 'dim'] }}"
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ plan.lights == 'dim' }}"
+            then:
+              - variables:
+                  dim_targets: >-
+                    {%- set ns = namespace(l=[]) -%}
+                    {%- for l in lights_on_now | select('match', 'light\\.') -%}
+                      {%- if state_attr(l, 'brightness') | int(0) > warn_brightness * 2.55 -%}
+                        {%- set ns.l = ns.l + [l] -%}
+                      {%- endif -%}
+                    {%- endfor -%}
+                    {{ ns.l }}
+              - if:
+                  - condition: template
+                    value_template: "{{ dim_targets | count > 0 }}"
+                then:
+                  - action: light.turn_on
+                    target:
+                      entity_id: "{{ dim_targets }}"
+                    data: >-
+                      {{ dict({'brightness_pct': warn_brightness | int},
+                              **({'transition': transition | float} if transition | float(0) > 0 else {})) }}
+              # New motion restarts the automation and restores the light.
+              - delay:
+                  seconds: "{{ [warn_seconds - occupancy.vacant_for + delay, 0] | max }}"
+          - variables:
+              still_on: "{{ all_lights | select('is_state', 'on') | list }}"
+          - if:
+              - condition: template
+                value_template: "{{ still_on | select('match', 'light\\.') | list | count > 0 }}"
+            then:
+              - action: light.turn_off
+                target:
+                  entity_id: "{{ still_on | select('match', 'light\\.') | list }}"
+                data: "{{ {'transition': transition | float} if transition | float(0) > 0 else {} }}"
+          - if:
+              - condition: template
+                value_template: "{{ still_on | select('match', 'switch\\.') | list | count > 0 }}"
+            then:
+              - action: switch.turn_off
+                target:
+                  entity_id: "{{ still_on | select('match', 'switch\\.') | list }}"
